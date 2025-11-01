@@ -1,0 +1,9 @@
+use_dpe: false
+behavior_policy:
+  type: "mle"
+  smoothing: 1.0e-5
+
+
+importance:
+  clip_ratio: 10.0
+  use_baseline: true

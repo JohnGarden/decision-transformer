@@ -1,0 +1,20 @@
+d_model: 256
+n_layers: 6
+n_heads: 8
+d_ff: 1024
+dropout: 0.1
+
+
+vocab:
+  n_actions: 3 # benign, malicious, wait
+  start_action_id: 3
+
+
+embeddings:
+  state_dim: 128 # após tokenização/AE
+  rtg_dim: 64
+  time_dim: 32
+
+
+regularization:
+  label_smoothing: 0.0

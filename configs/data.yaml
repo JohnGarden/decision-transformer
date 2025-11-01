@@ -1,0 +1,17 @@
+seed: 42
+paths:
+  data_root: "data/raw/unsw-nb15/csv"
+  train_csv: "${paths.data_root}/UNSW_NB15_training-set.csv"
+  test_csv: "${paths.data_root}/UNSW_NB15_testing-set.csv"
+
+
+processing:
+  normalize: true
+  categorical_embed: true
+  time_unit: "s" # "ms" opcional
+
+
+sequence:
+  context_length: 20
+  pad_token: 0
+  start_action: 3 # id especial para <START>
