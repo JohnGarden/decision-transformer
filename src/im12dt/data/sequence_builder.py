@@ -10,13 +10,15 @@ class SequenceExample:
 
     Todas as matrizes têm comprimento fixo K (com padding à esquerda) e dtype estável.
     """
-    states: np.ndarray      # (K, d_state)  float32
-    actions_in: np.ndarray  # (K,) int64 — ação t-1 (com START na primeira posição válida)
-    actions_out: np.ndarray # (K,) int64 — rótulo/ação alvo em t
-    rtg: np.ndarray         # (K,) float32 — return-to-go alinhado por passo
-    delta_t: np.ndarray     # (K,) float32 — Δt entre eventos
-    attn_mask: np.ndarray   # (K,) uint8  — 1 para tokens válidos, 0 para padding
-    length: int             # T real da janela (<= K)
+    states: np.ndarray                          # (K, d_state)  float32
+    actions_in: np.ndarray                      # (K,) int64 — ação t-1 (com START na primeira posição válida)
+    actions_out: np.ndarray                     # (K,) int64 — rótulo/ação alvo em t
+    rtg: np.ndarray                             # (K,) float32 — return-to-go alinhado por passo
+    delta_t: np.ndarray                         # (K,) float32 — Δt entre eventos
+    attn_mask: np.ndarray                       # (K,) uint8  — 1 para tokens válidos, 0 para padding
+    length: int                                 # T real da janela (<= K)
+    cats: dict[str, np.ndarray] | None = None   # (opcional) {name: (K,)}
+
 
 
 def right_pad_to_K(x: np.ndarray, K: int, pad_value: float = 0.0, axis: int = 0) -> Tuple[np.ndarray, np.ndarray]:
@@ -60,6 +62,7 @@ def build_window(
     delta_t: np.ndarray,
     K: int,
     start_action_id: int,
+    cats: dict[str, np.ndarray] | None = None,
 ) -> SequenceExample:
     """Monta uma janela alinhada à direita com START token para actions_in.
 
@@ -84,6 +87,14 @@ def build_window(
     rtg_pad, _ = right_pad_to_K(rtg_valid, K, pad_value=0.0, axis=0)
     dt_pad, _ = right_pad_to_K(delta_t, K, pad_value=0.0, axis=0)
 
+    # categorias (se existirem)
+    cats_pad = None
+    if cats:
+        cats_pad = {}
+        for name, arr in cats.items():
+            arr_pad, _ = right_pad_to_K(arr, K, pad_value=0, axis=0)
+            cats_pad[name] = arr_pad.astype(np.int64)
+
     return SequenceExample(
         states=states_pad.astype(np.float32),
         actions_in=actions_in_pad.astype(np.int64),
@@ -92,6 +103,7 @@ def build_window(
         delta_t=dt_pad.astype(np.float32),
         attn_mask=mask.astype(np.uint8),
         length=int(mask.sum()),
+        cats=cats_pad,
     )
 
 
@@ -110,8 +122,11 @@ def build_trajectory_windows(
     DT = traj["delta_t"]
     T = S.shape[0]
 
-    out: List[SequenceExample] = []
+    out: List[SequenceExample] = []      
+
+    cats = traj.get("cats", None)        
     for s, e in sliding_windows(T, K):
-        ex = build_window(S[s:e], A[s:e], R[s:e], DT[s:e], K, start_action_id)
+        cats_slice = {k: v[s:e] for k, v in cats.items()} if cats else None
+        ex = build_window(S[s:e], A[s:e], R[s:e], DT[s:e], K, start_action_id, cats=cats_slice)
         out.append(ex)
     return out

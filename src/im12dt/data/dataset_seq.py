@@ -97,6 +97,7 @@ def _standardize_apply(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.n
 
 @dataclass
 class SeqDatasetConfig:
+    # ---- todos sem default primeiro ----
     csv_path: str
     flow_keys: List[str]
     time_col: Optional[str]
@@ -106,6 +107,8 @@ class SeqDatasetConfig:
     normalize: bool
     label_col: str
     attack_cat_col: Optional[str]
+    # ---- só depois vêm os com default ----
+    categorical_cols: list[str] | None = None
 
 
 class UNSWSequenceDataset(Dataset):
@@ -163,6 +166,20 @@ class UNSWSequenceDataset(Dataset):
         R = np.ones_like(A, dtype=np.float32)  # baseline: +1 por passo
         DT = df["_dt"].to_numpy(dtype=np.float32)
 
+
+       # Categóricas → IDs
+        cat_cols = [c for c in (cfg.categorical_cols or []) if c in df.columns]
+        cat_maps: dict[str, dict[str, int]] = {}
+        cat_ids_df = {}
+        for c in cat_cols:
+            vals = df[c].astype(str).fillna("<UNK>")
+            uniq = list(dict.fromkeys(vals.tolist()))  # ordem de aparecimento
+            stoi = {u: i for i, u in enumerate(["<UNK>"] + [u for u in uniq if u != "<UNK>"])}
+            cat_maps[c] = stoi
+            cat_ids_df[c] = vals.map(lambda s: stoi.get(s, 0)).astype(int)
+        self._cat_maps = cat_maps
+
+
         # Quebra por flows
         flow_keys = _select_flow_keys(df, cfg.flow_keys)
         if flow_keys:
@@ -183,6 +200,10 @@ class UNSWSequenceDataset(Dataset):
             RR = R[rows]
             DDT = DT[rows]
             traj = {"states": S, "actions": AA, "rewards": RR, "delta_t": DDT}
+            # anexar categóricas como dict de arrays alinhados
+            if cat_cols:
+                traj["cats"] = {c: cat_ids_df[c].to_numpy(dtype=int)[rows] for c in cat_cols}
+
             windows = build_trajectory_windows(traj, K, start_action_id)
             examples.extend(windows)
 
@@ -194,7 +215,7 @@ class UNSWSequenceDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         ex = self.examples[idx]
-        return {
+        out = {
             "states": torch.from_numpy(ex.states),        # (K,d)
             "actions_in": torch.from_numpy(ex.actions_in),
             "actions_out": torch.from_numpy(ex.actions_out),
@@ -203,7 +224,11 @@ class UNSWSequenceDataset(Dataset):
             "attn_mask": torch.from_numpy(ex.attn_mask),
             "length": torch.tensor(ex.length, dtype=torch.int64),
         }
-
+        # exporta categóricas
+        if hasattr(ex, "cats") and isinstance(ex.cats, dict):
+            for c, arr in ex.cats.items():
+                out[f"cat_{c}"] = torch.from_numpy(arr.astype("int64"))
+        return out
 
 def seq_collate(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     out: Dict[str, torch.Tensor] = {}

@@ -10,11 +10,27 @@ vocab:
   start_action_id: 3
 
 
+# Dimensão alvo do "token de estado" após tokenização/AE
 embeddings:
-  state_dim: 128 # após tokenização/AE
+  state_embed_dim: 128   # igual ao state_dim já previsto
   rtg_dim: 64
   time_dim: 32
 
 
 regularization:
   label_smoothing: 0.0
+
+
+# Especificações de categóricas
+categorical:
+  cols: ["proto", "service", "state"]
+  # regra do tamanho do embedding: sqrt, log ou fixed
+  embed_rule: "sqrt"   # sqrt(n_cat)*2, clip [4, 32]
+  fixed_dim: 16        # usado se embed_rule=="fixed"
+
+# Autoencoder
+autoencoder:
+  use: false
+  bottleneck_dim: 32
+  hidden: [256, 128]
+  dropout: 0.0
