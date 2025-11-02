@@ -9,9 +9,19 @@ processing:
   normalize: true
   categorical_embed: true
   time_unit: "s" # "ms" opcional
+  # chaves de flow — usa apenas as colunas que existirem no CSV
+  #flow_keys: ["srcip", "sport", "dstip", "dsport", "proto"]
+  flow_keys: ["proto", "service", "state"]
+  # coluna de tempo (se ausente, cai em fallback: 'dur' ou passo=1)
+  time_col: null # exemplos: "timestamp", "stime", "time", "dur"
 
 
 sequence:
   context_length: 20
   pad_token: 0
   start_action: 3 # id especial para <START>
+
+labels:
+  label_col: "label"
+  attack_cat_col: "attack_cat" # usado como fallback para derivar label
+  #positive_names: ["Malware", "Fuzzers", "Analysis", "Backdoor", "DoS", "Exploits", "Generic", "Reconnaissance", "Shellcode", "Worms"]
