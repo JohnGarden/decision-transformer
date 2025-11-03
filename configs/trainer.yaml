@@ -11,11 +11,11 @@ scheduler:
 
 
 training:
+  max_epochs: 2            # exemplo; ajuste para os seus experimentos
+  steps_per_epoch: 1000    # ou None para varrer toda a época
   batch_size: 128
-  max_steps: 50_000
-  log_every: 50
-  eval_every: 1_000
-  precision: bf16 # ou fp32
+  grad_clip: 1.0
+  precision: fp32
 
 
 metrics:
@@ -24,3 +24,16 @@ metrics:
     benign: 0.5
   ttr:
     percentile_report: [50, 90]
+
+sampler:
+  pos_weight: 4.0          # peso extra para janelas com ao menos um positivo
+
+inference:
+  wait_threshold: 0.6      # se max_prob < 0.6 → ação = wait
+
+reward:
+  cTP: 2.0
+  cTN: 0.5
+  cFP: -2.0
+  cFN: -3.0
+  cWAIT: -0.1

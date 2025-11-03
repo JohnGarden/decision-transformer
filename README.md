@@ -10,7 +10,11 @@ Reprodução do método para detecção de intrusões em tempo real com Decision
 
 
 ### Setup rápido
+
 ```bash
+#Lembre-se de instalar o cuda, caso você tenha GPU NVIDIA.
+python -m pip install --index-url https://download.pytorch.org/whl/cu124 torch torchvision torchaudio
+
 # 1 criar e ativar ambiente
 bash scripts/setup_env.sh
 source .venv/Scripts/activate

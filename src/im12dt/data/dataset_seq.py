@@ -148,7 +148,7 @@ class UNSWSequenceDataset(Dataset):
 
         # Seleção de features numéricas
         #drop_cols = set([cfg.label_col, cfg.attack_cat_col, cfg.time_col, "_label", "_time", "_dt"]) - {None}
-
+        '''
         # retirar id explicitamente do conjunto de features e tornar a seleção numérica robusta
         # __init__ já ordena por time_col quando existe; com time_col=null, ele ordena por id (que está presente). O Δt permanece derivado de dur cumulativo
         drop_cols = set([cfg.label_col, cfg.attack_cat_col, cfg.time_col, "_label", "_time", "_dt", "id"]) - {None}
@@ -160,6 +160,38 @@ class UNSWSequenceDataset(Dataset):
             self._stats = {"mean": mean.astype(np.float32), "std": std.astype(np.float32), "num_cols": num_cols}
         else:
             self._stats = {"mean": None, "std": None, "num_cols": num_cols}
+        '''
+
+
+        # Seleção de features numéricas
+        drop_cols = set([cfg.label_col, cfg.attack_cat_col, cfg.time_col, "_label", "_time", "_dt", "id"]) - {None}
+        num_cols = _select_numeric_columns(df, drop=list(drop_cols))
+        # 1) coagir valores não numéricos -> NaN; 2) imputar faltas; 3) normalizar com nan-safe
+        if num_cols:
+            df[num_cols] = df[num_cols].apply(pd.to_numeric, errors="coerce")
+            df[num_cols] = df[num_cols].fillna(0.0)
+            X = df[num_cols].to_numpy(dtype=np.float32)
+        else:
+            X = np.zeros((len(df), 0), dtype=np.float32)
+        if cfg.normalize and X.size > 0:
+            # médias/desvios nan-safe
+            
+            mean = np.nanmean(X, axis=0, keepdims=True)
+            std  = np.nanstd (X, axis=0, keepdims=True) + 1e-8
+            X = (X - mean) / std
+            # CLIPPING de z-score para evitar estouro no attention
+            np.clip(X, -8.0, 8.0, out=X)
+            # blindagem final
+            X[~np.isfinite(X)] = 0.0            
+            
+            self._stats = {"mean": mean.astype(np.float32), "std": std.astype(np.float32), "num_cols": num_cols}
+        else:
+            self._stats = {"mean": None, "std": None, "num_cols": num_cols}
+
+
+
+##############
+
 
         # Ações (0=benign, 1=malicious) — START será aplicado no builder
         A = df["_label"].to_numpy(dtype=np.int64)
@@ -198,7 +230,11 @@ class UNSWSequenceDataset(Dataset):
             S = X[rows]
             AA = A[rows]
             RR = R[rows]
+            # Δt sempre finito e não-negativo
             DDT = DT[rows]
+            DDT = np.nan_to_num(DDT, nan=0.0, posinf=1e6, neginf=0.0)
+            DDT = np.maximum(DDT, 0.0)
+
             traj = {"states": S, "actions": AA, "rewards": RR, "delta_t": DDT}
             # anexar categóricas como dict de arrays alinhados
             if cat_cols:

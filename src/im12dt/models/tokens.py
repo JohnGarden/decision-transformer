@@ -47,7 +47,9 @@ class CategoricalTokenizer(nn.Module):
     def forward(self, cats: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         out = {}
         for name, tens in cats.items():
-            out[name] = self.emb[name](tens)  # (B, K, d_cat[name])
+            if tens.device != next(self.emb[name].parameters()).device:
+                raise RuntimeError(f"[{name}] indices on {tens.device}, embedding on {next(self.emb[name].parameters()).device}")
+            out[name] = self.emb[name](tens)
         return out
 
 

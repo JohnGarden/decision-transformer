@@ -19,7 +19,8 @@ class TimeEncodingFourier(nn.Module):
 
     def forward(self, dt: torch.Tensor) -> torch.Tensor:
         # dt: (B, K) em segundos (ou unidade relativa)
-        x = dt
+        x = torch.nan_to_num(dt, nan=0.0, posinf=1e6, neginf=0.0)
+
         if self.clip_p95 is not None:
             x = torch.clamp(x, max=self.clip_p95)
         if self.use_log1p:

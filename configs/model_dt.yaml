@@ -1,4 +1,4 @@
-d_model: 256
+d_model: 128
 n_layers: 6
 n_heads: 8
 d_ff: 1024
@@ -16,7 +16,10 @@ embeddings:
   rtg_dim: 64
   time_dim: 32
 
-
+loss:
+  label_smoothing: 0.0
+  class_weights: [1.0, 3.0, 1.0]   # pesa mais a classe positiva (malicious)
+  
 regularization:
   label_smoothing: 0.0
 
