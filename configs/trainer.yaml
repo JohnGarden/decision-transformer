@@ -11,7 +11,7 @@ scheduler:
 
 
 training:
-  max_epochs: 2            # exemplo; ajuste para os seus experimentos
+  max_epochs: 10            
   steps_per_epoch: 1000    # ou None para varrer toda a época
   batch_size: 128
   grad_clip: 1.0

@@ -1,6 +1,8 @@
+# src/im12dt/data/dataset_seq.py
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Dict, List, Optional, Any
 from pathlib import Path
 
 import numpy as np
@@ -8,96 +10,14 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from .sequence_builder import SequenceExample, build_trajectory_windows
-
-_NUMERIC_KINDS = set("iufcb")  # int, unsigned, float, complex, bool
-
-# -------------------------------
-# Utilidades de features
-# -------------------------------
-
-def _select_flow_keys(df: pd.DataFrame, candidates: List[str]) -> List[str]:
-    return [c for c in candidates if c in df.columns]
+from .sequence_builder import build_trajectory_windows  # exige patch do Dia 5 (abs_time/flow_id/cats)
 
 
-def _derive_label(df: pd.DataFrame, label_col: str, attack_cat_col: Optional[str]) -> pd.Series:
-    if label_col in df.columns:
-        return df[label_col].astype(int)
-    if attack_cat_col and attack_cat_col in df.columns:
-        ac = df[attack_cat_col].astype(str).str.lower()
-        return (ac != "normal").astype(int)
-    raise KeyError("Não foi possível derivar a coluna de label. Informe 'label_col' ou 'attack_cat_col'.")
-
-
-def _time_from_row(df: pd.DataFrame, preferred: Optional[str]) -> np.ndarray:
-    # Prioridade: coluna informada -> 'timestamp'/'time'/'stime' -> 'dur' acumulado -> passo=1
-    cols = []
-    if preferred and preferred in df.columns:
-        cols = [preferred]
-    else:
-        for c in ["timestamp", "time", "stime"]:
-            if c in df.columns:
-                cols = [c]; break
-    if cols:
-        t = pd.to_datetime(df[cols[0]], errors="coerce")
-        if t.notna().any():
-            # segundos relativos ao primeiro observado
-            ts = t.view("int64") / 1e9  # ns → s
-            ts = ts - np.nanmin(ts)
-            ts[np.isnan(ts)] = 0.0
-            return ts.astype(np.float32)
-    if "dur" in df.columns:
-        # trata dur como delta por linha e faz cumulativa
-        d = pd.to_numeric(df["dur"], errors="coerce").fillna(0.0).astype(float).values
-        return np.cumsum(d).astype(np.float32)
-    # fallback: passos uniformes
-    return np.arange(len(df), dtype=np.float32)
-
-
-def _delta_from_time(t: np.ndarray) -> np.ndarray:
-    if t.size == 0:
-        return t
-    dt = np.diff(t, prepend=t[:1])
-    dt[0] = 0.0
-    return dt.astype(np.float32)
-
-
-def _split_by_flows(df: pd.DataFrame, flow_keys: List[str]) -> List[pd.DataFrame]:
-    if not flow_keys:
-        # Sem chaves: retorna uma trajetória única com a ordem original.
-        return [df]
-    groups = []
-    for _, g in df.groupby(flow_keys, sort=False, dropna=False):
-        groups.append(g)
-    return groups
-
-
-def _select_numeric_columns(df: pd.DataFrame, drop: List[str]) -> List[str]:
-    cols = []
-    for c, s in df.items():
-        if c in drop:  # ignora colunas de controle/label
-            continue
-        if s.dtype.kind in _NUMERIC_KINDS:
-            cols.append(c)
-    return cols
-
-
-def _standardize_fit(x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    mean = x.mean(axis=0, keepdims=True)
-    std = x.std(axis=0, keepdims=True) + 1e-8
-    return mean, std
-
-
-def _standardize_apply(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
-    return (x - mean) / std
-
-# -------------------------------
-# Dataset
-# -------------------------------
-
+# -------------------------------------------------------------------
+# Config
+# -------------------------------------------------------------------
 @dataclass
 class SeqDatasetConfig:
-    # ---- todos sem default primeiro ----
     csv_path: str
     flow_keys: List[str]
     time_col: Optional[str]
@@ -106,171 +26,288 @@ class SeqDatasetConfig:
     pad_token: int
     normalize: bool
     label_col: str
-    attack_cat_col: Optional[str]
-    # ---- só depois vêm os com default ----
-    categorical_cols: list[str] | None = None
+    attack_cat_col: str
+    # novas: lista de colunas categóricas a mapear (ex.: ["proto","service","state"])
+    categorical_cols: Optional[List[str]] = None
 
 
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
+def _ensure_2d_row(x: np.ndarray) -> np.ndarray:
+    if x.ndim == 1:
+        return x.reshape(1, -1)
+    return x
+
+
+def _select_numeric_columns(df: pd.DataFrame, drop: List[str] | set[str]) -> List[str]:
+    drop_set = set(drop)
+    cols = []
+    for c in df.columns:
+        if c in drop_set:
+            continue
+        if pd.api.types.is_numeric_dtype(df[c]):
+            cols.append(c)
+    return cols
+
+
+def _valid_flow_keys(df: pd.DataFrame, keys: List[str] | None) -> List[str]:
+    if not keys:
+        return []
+    return [k for k in keys if k in df.columns]
+
+
+def _to_np32(x: Any) -> np.ndarray:
+    """Converte list/np/tensor -> np.float32."""
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().numpy()
+    return np.asarray(x, dtype=np.float32)
+
+
+# -------------------------------------------------------------------
+# Dataset
+# -------------------------------------------------------------------
 class UNSWSequenceDataset(Dataset):
-    """Constrói janelas K (SequenceExample) a partir de um CSV UNSW-NB15.
-
-    - Gera ações alvo a partir da coluna `label` (0=benign, 1=malicious).
-    - Recompensa de **baseline**: r_t = 1.0 para todo passo (imitando especialista),
-      o que torna RTG_t := T - t. Pesos sofisticados entram em etapas futuras.
-    - Δt derivado da coluna temporal, de `dur` ou de passos discretos.
-    - Apenas **colunas numéricas** são usadas em `states` inicialmente (as categóricas serão
-      incorporadas via embeddings futuramente).
+    """
+    Constrói janelas causais (K) a partir do CSV UNSW_NB15, com:
+      - normalização opcional (overrideável com stats do treino),
+      - mapeamento categórico por coluna (overrideável com stoi do treino),
+      - exporta 'flow_id' e 'abs_time' para avaliação de TTR.
+    Requer que sequence_builder tenha sido patchado para propagar abs_time/flow_id/cats.
     """
 
-    def __init__(self, cfg: SeqDatasetConfig, max_rows: Optional[int] = None):
+    def __init__(
+        self,
+        cfg: SeqDatasetConfig,
+        max_rows: Optional[int] = None,
+        *,
+        stats_override: Optional[Dict[str, np.ndarray]] = None,
+        cat_maps_override: Optional[Dict[str, Dict[str, int]]] = None,
+    ):
         super().__init__()
         self.cfg = cfg
-        self.max_rows = max_rows
 
+        # ------------------ leitura ------------------
         df = pd.read_csv(cfg.csv_path)
         if max_rows is not None:
-            df = df.head(max_rows)
+            df = df.head(int(max_rows))
 
-        # Ordenação determinística (se houver uma coluna de índice/tempo)
-        if cfg.time_col and cfg.time_col in df.columns:
-            df = df.sort_values(cfg.time_col, kind="mergesort").reset_index(drop=True)
-        elif "id" in df.columns:
-            df = df.sort_values("id", kind="mergesort").reset_index(drop=True)
-
-        # Label alvo
-        y = _derive_label(df, cfg.label_col, cfg.attack_cat_col)
-        df = df.assign(_label=y.values)
-
-        # Construção de tempo e Δt
-        t = _time_from_row(df, cfg.time_col)
-        dt = _delta_from_time(t)
-        df = df.assign(_time=t, _dt=dt)
-
-        # Seleção de features numéricas
-        #drop_cols = set([cfg.label_col, cfg.attack_cat_col, cfg.time_col, "_label", "_time", "_dt"]) - {None}
-        '''
-        # retirar id explicitamente do conjunto de features e tornar a seleção numérica robusta
-        # __init__ já ordena por time_col quando existe; com time_col=null, ele ordena por id (que está presente). O Δt permanece derivado de dur cumulativo
-        drop_cols = set([cfg.label_col, cfg.attack_cat_col, cfg.time_col, "_label", "_time", "_dt", "id"]) - {None}
-        num_cols = _select_numeric_columns(df, drop=list(drop_cols))
-        X = df[num_cols].to_numpy(dtype=np.float32)
-        if cfg.normalize and X.size > 0:
-            mean, std = _standardize_fit(X)
-            X = _standardize_apply(X, mean, std)
-            self._stats = {"mean": mean.astype(np.float32), "std": std.astype(np.float32), "num_cols": num_cols}
-        else:
-            self._stats = {"mean": None, "std": None, "num_cols": num_cols}
-        '''
-
-
-        # Seleção de features numéricas
-        drop_cols = set([cfg.label_col, cfg.attack_cat_col, cfg.time_col, "_label", "_time", "_dt", "id"]) - {None}
-        num_cols = _select_numeric_columns(df, drop=list(drop_cols))
-        # 1) coagir valores não numéricos -> NaN; 2) imputar faltas; 3) normalizar com nan-safe
-        if num_cols:
-            df[num_cols] = df[num_cols].apply(pd.to_numeric, errors="coerce")
-            df[num_cols] = df[num_cols].fillna(0.0)
-            X = df[num_cols].to_numpy(dtype=np.float32)
-        else:
-            X = np.zeros((len(df), 0), dtype=np.float32)
-        if cfg.normalize and X.size > 0:
-            # médias/desvios nan-safe
-            
-            mean = np.nanmean(X, axis=0, keepdims=True)
-            std  = np.nanstd (X, axis=0, keepdims=True) + 1e-8
-            X = (X - mean) / std
-            # CLIPPING de z-score para evitar estouro no attention
-            np.clip(X, -8.0, 8.0, out=X)
-            # blindagem final
-            X[~np.isfinite(X)] = 0.0            
-            
-            self._stats = {"mean": mean.astype(np.float32), "std": std.astype(np.float32), "num_cols": num_cols}
-        else:
-            self._stats = {"mean": None, "std": None, "num_cols": num_cols}
-
-
-
-##############
-
-
-        # Ações (0=benign, 1=malicious) — START será aplicado no builder
-        A = df["_label"].to_numpy(dtype=np.int64)
-        R = np.ones_like(A, dtype=np.float32)  # baseline: +1 por passo
-        DT = df["_dt"].to_numpy(dtype=np.float32)
-
-
-       # Categóricas → IDs
+        # ------------------ categóricas -> stoi/ids ------------------
         cat_cols = [c for c in (cfg.categorical_cols or []) if c in df.columns]
-        cat_maps: dict[str, dict[str, int]] = {}
-        cat_ids_df = {}
+        self.cat_cols: List[str] = cat_cols
+        self._cat_maps: Dict[str, Dict[str, int]] = {}
+
+        if cat_maps_override:
+            # usa mapas do treino; garante <UNK>=0
+            for c in cat_cols:
+                base = dict(cat_maps_override.get(c, {}))
+                if "<UNK>" not in base:
+                    base = {"<UNK>": 0, **{k: v for k, v in base.items() if k != "<UNK>"}}
+                else:
+                    # assegura que <UNK> é 0; se não for, reindexa
+                    if base.get("<UNK>", None) != 0:
+                        inv = sorted(base.items(), key=lambda kv: kv[1])
+                        # realoca mantendo as demais posições
+                        new = {"<UNK>": 0}
+                        nxt = 1
+                        for k, v in inv:
+                            if k == "<UNK>":
+                                continue
+                            new[k] = nxt
+                            nxt += 1
+                        base = new
+                self._cat_maps[c] = base
+        else:
+            # cria stoi por ordem de aparecimento no CSV
+            for c in cat_cols:
+                vals = df[c].astype(str).fillna("<UNK>")
+                uniq = list(dict.fromkeys(vals.tolist()))
+                stoi = {"<UNK>": 0}
+                for u in uniq:
+                    if u != "<UNK>" and u not in stoi:
+                        stoi[u] = len(stoi)
+                self._cat_maps[c] = stoi
+
+        # materializa colunas __cat_* por linha
         for c in cat_cols:
-            vals = df[c].astype(str).fillna("<UNK>")
-            uniq = list(dict.fromkeys(vals.tolist()))  # ordem de aparecimento
-            stoi = {u: i for i, u in enumerate(["<UNK>"] + [u for u in uniq if u != "<UNK>"])}
-            cat_maps[c] = stoi
-            cat_ids_df[c] = vals.map(lambda s: stoi.get(s, 0)).astype(int)
-        self._cat_maps = cat_maps
+            stoi = self._cat_maps[c]
+            df[f"__cat_{c}"] = df[c].astype(str).fillna("<UNK>").map(lambda s: stoi.get(s, 0)).astype("int64")
 
+        # ------------------ seleção numérica ------------------
+        # sempre remove originais categóricas, ids, rótulos e tempo
+        drop_cols = set(
+            [cfg.label_col, cfg.attack_cat_col, "id"]   # ← NÃO removemos cfg.time_col aqui
+            + [c for c in cat_cols]
+            + [f"__cat_{c}" for c in cat_cols]
+        ) - {None}
+        num_cols = _select_numeric_columns(df, drop=drop_cols)
+        self.num_cols: List[str] = num_cols
 
-        # Quebra por flows
-        flow_keys = _select_flow_keys(df, cfg.flow_keys)
+        X = df[num_cols].to_numpy(dtype=np.float32)  # (N, D_num)
+        y = df[cfg.label_col].astype(int).to_numpy()  # (N,)
+        attack_cat = df[cfg.attack_cat_col].astype(str).fillna("Normal").to_numpy()
+
+        # ------------------ tempo absoluto e Δt ------------------
+        if cfg.time_col and cfg.time_col in df.columns:
+            t_abs = df[cfg.time_col].astype(float).to_numpy()
+        else:
+            # surrogate: índice crescente
+            t_abs = np.arange(len(df), dtype=np.float64)
+        # Δt por linha (em relação ao anterior globalmente); ok porque agrupamos por índice depois
+        dt_global = np.diff(t_abs, prepend=t_abs[0])
+
+        # ------------------ normalização ------------------
+        self._stats: Optional[Dict[str, np.ndarray]] = None
+        if cfg.normalize:
+            if stats_override and ("mean" in stats_override) and ("std" in stats_override):
+                m = _to_np32(stats_override["mean"])
+                s = _to_np32(stats_override["std"])
+                # shapes esperadas: (1, D) ou (D,)
+                m = _ensure_2d_row(m)
+                s = _ensure_2d_row(s)
+            else:
+                m = np.nanmean(X, axis=0, keepdims=True)
+                s = np.nanstd(X, axis=0, keepdims=True)
+            s = s + 1e-6
+            X = (np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0) - m) / s
+            self._stats = {"mean": m.astype(np.float32), "std": s.astype(np.float32)}
+
+        # ------------------ flow grouping ------------------
+        flow_keys = _valid_flow_keys(df, cfg.flow_keys)
         if flow_keys:
+            # hash determinístico por conjunto de colunas
             df["_flow_key"] = pd.util.hash_pandas_object(df[flow_keys], index=False).astype(np.int64)
             groups = [g for _, g in df.groupby("_flow_key", sort=False)]
         else:
+            df["_flow_key"] = 0
             groups = [df]
 
-        # Constrói janelas por flow
-        K = cfg.context_length
-        start_action_id = cfg.start_action
-        examples: List[SequenceExample] = []
+        # mapeamento flow_id -> categoria dominante (para diagnóstico)
+        self._flow_attack_cat: Dict[int, str] = {}
+
+        # ------------------ construir janelas ------------------
+        K = int(cfg.context_length)
+        start_id = int(cfg.start_action)
+        examples = []
 
         for g in groups:
             rows = g.index.values
-            S = X[rows]
-            AA = A[rows]
-            RR = R[rows]
-            # Δt sempre finito e não-negativo
-            DDT = DT[rows]
-            DDT = np.nan_to_num(DDT, nan=0.0, posinf=1e6, neginf=0.0)
-            DDT = np.maximum(DDT, 0.0)
+            S = X[rows]                                     # (T, D)
+            A = y[rows].astype(np.int64)                    # (T,)
+            R = (A == 1).astype(np.float32)                 # reward simples para RTG
+            # Tempo local do fluxo:
+            if cfg.time_col and (cfg.time_col in df.columns):
+                # Ex.: cfg.time_col == "dur" (segundos por registro)
+                dt_flow = df.loc[rows, cfg.time_col].astype(float).to_numpy().astype(np.float32)
+            elif "dur" in df.columns:
+                dt_flow = df.loc[rows, "dur"].astype(float).to_numpy().astype(np.float32)
+            else:
+                dt_flow = np.ones(len(rows), dtype=np.float32)
+            at_flow = np.cumsum(dt_flow, dtype=np.float64)
+            DT = dt_flow
+            AT = at_flow
+            FID = int(g["_flow_key"].iloc[0])
 
-            traj = {"states": S, "actions": AA, "rewards": RR, "delta_t": DDT}
-            # anexar categóricas como dict de arrays alinhados
-            if cat_cols:
-                traj["cats"] = {c: cat_ids_df[c].to_numpy(dtype=int)[rows] for c in cat_cols}
+            # categóricas alinhadas às linhas do grupo
+            CATS: Optional[Dict[str, np.ndarray]] = None
+            if len(cat_cols) > 0:
+                CATS = {c: df.loc[rows, f"__cat_{c}"].to_numpy(dtype=np.int64) for c in cat_cols}
 
-            windows = build_trajectory_windows(traj, K, start_action_id)
+            # attack_cat dominante no fluxo (dos positivos; se não houver, majoritário global)
+            g_labels = y[rows]
+            g_attack = attack_cat[rows]
+            if (g_labels == 1).any():
+                vals, counts = np.unique(g_attack[g_labels == 1], return_counts=True)
+            else:
+                vals, counts = np.unique(g_attack, return_counts=True)
+            self._flow_attack_cat[FID] = str(vals[np.argmax(counts)])
+
+            traj = {
+                "states": S,
+                "actions": A,
+                "rewards": R,
+                "delta_t": DT,
+                "abs_time": AT,
+                "flow_id": np.full_like(A, FID, dtype=np.int64),
+                "cats": CATS,
+            }
+            windows = build_trajectory_windows(traj, K, start_id)
             examples.extend(windows)
 
         self.examples = examples
 
-    # --------------- PyTorch API ---------------
+    # ------------------ dataset protocol ------------------
     def __len__(self) -> int:
         return len(self.examples)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         ex = self.examples[idx]
-        out = {
-            "states": torch.from_numpy(ex.states),        # (K,d)
-            "actions_in": torch.from_numpy(ex.actions_in),
-            "actions_out": torch.from_numpy(ex.actions_out),
-            "rtg": torch.from_numpy(ex.rtg),
-            "delta_t": torch.from_numpy(ex.delta_t),
-            "attn_mask": torch.from_numpy(ex.attn_mask),
-            "length": torch.tensor(ex.length, dtype=torch.int64),
+        out: Dict[str, torch.Tensor] = {
+            "states": torch.from_numpy(ex.states),           # (K, D)
+            "actions_in": torch.from_numpy(ex.actions_in),   # (K,)
+            "actions_out": torch.from_numpy(ex.actions_out), # (K,)
+            "rtg": torch.from_numpy(ex.rtg),                 # (K,)
+            "delta_t": torch.from_numpy(ex.delta_t),         # (K,)
+            "attn_mask": torch.from_numpy(ex.attn_mask),     # (K,) uint8
+            "length": torch.tensor(int(ex.length), dtype=torch.int64),
         }
-        # exporta categóricas
+        # extras do Dia 5
+        if hasattr(ex, "abs_time") and ex.abs_time is not None:
+            out["abs_time"] = torch.from_numpy(ex.abs_time.astype(np.float64))  # (K,)
+        if hasattr(ex, "flow_id") and ex.flow_id is not None:
+            out["flow_id"] = torch.tensor(int(ex.flow_id), dtype=torch.int64)   # escalar
+
+        # categóricas janeladas
         if hasattr(ex, "cats") and isinstance(ex.cats, dict):
             for c, arr in ex.cats.items():
-                out[f"cat_{c}"] = torch.from_numpy(arr.astype("int64"))
+                out[f"cat_{c}"] = torch.from_numpy(arr.astype(np.int64))        # (K,)
+
         return out
 
+    # ------------------ utilidades ------------------
+    def get_flow_attack_cat(self, fid: int) -> str:
+        """Retorna a attack_cat dominante (no fluxo) para diagnóstico."""
+        return self._flow_attack_cat.get(int(fid), "Unknown")
+
+
+# -------------------------------------------------------------------
+# Collate
+# -------------------------------------------------------------------
 def seq_collate(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    out: Dict[str, torch.Tensor] = {}
-    for k in batch[0].keys():
-        if k == "length":
-            out[k] = torch.stack([b[k] for b in batch], dim=0)
-        else:
-            out[k] = torch.stack([b[k] for b in batch], dim=0)
+    """
+    Empilha a lista de amostras (cada uma com forma (K, *)) em tensores (B, K, *).
+    Inclui também campos opcionais: cat_*, abs_time e flow_id.
+    """
+    # obrigatórios
+    states = torch.stack([b["states"] for b in batch], dim=0).to(torch.float32)            # (B, K, D)
+    actions_in = torch.stack([b["actions_in"] for b in batch], dim=0).to(torch.long)       # (B, K)
+    actions_out = torch.stack([b["actions_out"] for b in batch], dim=0).to(torch.long)     # (B, K)
+    rtg = torch.stack([b["rtg"] for b in batch], dim=0).to(torch.float32)                  # (B, K)
+    delta_t = torch.stack([b["delta_t"] for b in batch], dim=0).to(torch.float32)          # (B, K)
+    attn_mask = torch.stack([b["attn_mask"] for b in batch], dim=0).to(torch.uint8)        # (B, K)
+    length = torch.stack([b["length"] for b in batch], dim=0).to(torch.long)               # (B,)
+
+    out: Dict[str, torch.Tensor] = {
+        "states": states,
+        "actions_in": actions_in,
+        "actions_out": actions_out,
+        "rtg": rtg,
+        "delta_t": delta_t,
+        "attn_mask": attn_mask,
+        "length": length,
+    }
+
+    # opcionais: abs_time (B,K), flow_id (B,)
+    if "abs_time" in batch[0]:
+        abs_time = torch.stack([b["abs_time"] for b in batch], dim=0).to(torch.float64)     # (B, K)
+        out["abs_time"] = abs_time
+    if "flow_id" in batch[0]:
+        flow_id = torch.stack([b["flow_id"] for b in batch], dim=0).to(torch.long)          # (B,)
+        out["flow_id"] = flow_id
+
+    # categóricas: todos os campos cat_* presentes na primeira amostra
+    cat_keys = [k for k in batch[0].keys() if k.startswith("cat_")]
+    for k in cat_keys:
+        out[k] = torch.stack([b[k] for b in batch], dim=0).to(torch.long)                   # (B, K)
+
     return out

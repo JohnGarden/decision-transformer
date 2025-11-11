@@ -1,27 +1,38 @@
+# configs/data.yaml
+
+# Reproduz o campo usado antes (alguns scripts podem ler daqui)
 seed: 42
+
 paths:
+  # Mantido como no arquivo antigo (sem "../") para preservar paths relativos
   data_root: "data/raw/unsw-nb15/csv"
   train_csv: "${paths.data_root}/UNSW_NB15_training-set.csv"
-  test_csv: "${paths.data_root}/UNSW_NB15_testing-set.csv"
-
+  test_csv:  "${paths.data_root}/UNSW_NB15_testing-set.csv"
 
 processing:
+  # Mantido: normalização z-score (stats do treino serão reaplicadas na avaliação)
   normalize: true
-  categorical_embed: true
-  time_unit: "s" # "ms" opcional
-  # chaves de flow — usa apenas as colunas que existirem no CSV
-  #flow_keys: ["srcip", "sport", "dstip", "dsport", "proto"]
-  flow_keys: ["proto", "service", "state"]
-  # coluna de tempo (se ausente, cai em fallback: 'dur' ou passo=1)
-  time_col: null # exemplos: "timestamp", "stime", "time", "dur"
 
+  # Mantido por retrocompatibilidade (o pipeline novo não depende dele)
+  categorical_embed: true
+
+  # Informativo; o dataset usa 'dur' como Δt do fluxo (segundos)
+  time_unit: "s"
+
+  # Ajustado: chaves de fluxo com alta cardinalidade para TTR estável
+  flow_keys: ["ct_srv_src", "ct_state_ttl", "ct_dst_ltm", "ct_src_dport_ltm", "ct_dst_sport_ltm", "proto"]
+
+  # Ajustado: usar 'dur' como Δt e abs_time = cumsum(dur) por fluxo
+  time_col: "dur"
 
 sequence:
   context_length: 20
   pad_token: 0
-  start_action: 3 # id especial para <START>
+  # Mantido: id do <START>
+  start_action: 3
 
 labels:
   label_col: "label"
-  attack_cat_col: "attack_cat" # usado como fallback para derivar label
-  #positive_names: ["Malware", "Fuzzers", "Analysis", "Backdoor", "DoS", "Exploits", "Generic", "Reconnaissance", "Shellcode", "Worms"]
+  attack_cat_col: "attack_cat"
+  # (Opcional, documenta o mapeamento sem efeito no binário atual)
+  # positive_names: ["Malware", "Fuzzers", "Analysis", "Backdoor", "DoS", "Exploits", "Generic", "Reconnaissance", "Shellcode", "Worms"]
