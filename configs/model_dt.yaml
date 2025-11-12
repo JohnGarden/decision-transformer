@@ -6,7 +6,7 @@ dropout: 0.1
 
 
 vocab:
-  n_actions: 3 # benign, malicious, wait
+  n_actions: 2   # apenas {0,1}; 'wait' fica só na decodificação
   start_action_id: 3
 
 

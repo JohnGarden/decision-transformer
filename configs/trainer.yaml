@@ -1,39 +1,57 @@
-optimizer:
-  name: adamw
-  lr: 3.0e-4
-  betas: [0.9, 0.95]
-  weight_decay: 0.01
-
-
-scheduler:
-  name: cosine
-  warmup_steps: 200
-
+seed: 42
 
 training:
-  max_epochs: 10            
-  steps_per_epoch: 1000    # ou None para varrer toda a época
   batch_size: 128
+  max_epochs: 10
+  steps_per_epoch: 1000        # use null para varrer a época inteira
   grad_clip: 1.0
-  precision: fp32
+  precision: fp32               # atualmente ignorado pelo trainer (sem AMP)
+  lr: 3.0e-4                    # <- mover do bloco optimizer para cá
+  betas: [0.9, 0.95]            # <- manter seu valor
+  weight_decay: 0.01
+  label_smoothing: 0.05
+  class_weights: [1.0, 1.0]     # CE balance básico (normal, attack)
+  wait_threshold: 0.55          # usado no decode_with_wait durante a validação
+  reward_weights:               # <- mover do bloco 'reward' para cá
+    cTP: 2.0
+    cTN: 0.5
+    cFP: -2.0
+    cFN: -3.0
+    cWAIT: -0.1
+  eval_no_rtg: false
 
-
-metrics:
-  thresholds:
-    malicious: 0.5
-    benign: 0.5
-  ttr:
-    percentile_report: [50, 90]
+early_stopping:
+  monitor: "pr_auc"             # pr_auc | f1 | val_loss
+  mode: "max"
+  patience: 3
+  min_delta: 0.0001
+  restore_best: true
 
 sampler:
-  pos_weight: 4.0          # peso extra para janelas com ao menos um positivo
+  use_weighted_windows: true
+  window_pos_weight: 4.0        # equivalente à sua intenção de pos_weight=4
+
+# Importance Sampling
+is_dt:
+  enable: true
+  mode: "by_label"              # "by_label" | "by_attack_cat"
+  power: 0.5
+  w_min: 1.0
+  w_max: 10.0
+  normalize_batch: true
 
 inference:
-  wait_threshold: 0.6      # se max_prob < 0.6 → ação = wait
+  checkpoint: "artifacts/dt_baseline_20251111-224340.pt"
+  detection_mode: "any_step"    # "last_step" | "any_step" | "tail_m_of_last_L"
+  grid_wait: [0.30, 0.40, 0.50, 0.55, 0.60, 0.70, 0.80]
+  class_cut: 0.5
+  class_cuts: [0.5]
+  tail_m: 1
+  tail_L: 3
+  debug_missed: false
 
-reward:
-  cTP: 2.0
-  cTN: 0.5
-  cFP: -2.0
-  cFN: -3.0
-  cWAIT: -0.1
+logging:
+  log_every: 50
+  val_every: 1
+  save_ckpt: true
+  out_dir: "artifacts"

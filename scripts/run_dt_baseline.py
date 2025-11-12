@@ -45,6 +45,12 @@ def main():
     cfg_model = yaml.safe_load(Path("configs/model_dt.yaml").read_text())
     cfg_trn   = yaml.safe_load(Path("configs/trainer.yaml").read_text())
 
+    # Acessos convenientes com defaults
+    trn = cfg_trn.get("training", {})
+    inf = cfg_trn.get("inference", {})
+    opt_old = cfg_trn.get("optimizer", {})       # legado
+    reward_old = cfg_trn.get("reward", {})       # legado
+
     # --------- datasets ---------
     conf_train = SeqDatasetConfig(
         csv_path=str(Path(cfg_data["paths"]["train_csv"])),
@@ -64,46 +70,81 @@ def main():
 
     train_ds = UNSWSequenceDataset(conf_train, max_rows=None)
     # importante: usar estatísticas do *train* no *val* (sem vazamento)
-    val_ds   = UNSWSequenceDataset(conf_val,   max_rows=None, stats_override=train_ds._stats)
+    val_ds   = UNSWSequenceDataset(
+        conf_val,
+        max_rows=None,
+        stats_override=getattr(train_ds, "_stats", None),
+        cat_maps_override=getattr(train_ds, "_cat_maps", None),
+    )
 
-    # --------- sampler / dataloaders ---------
-    sampler = make_weighted_sampler(train_ds, pos_weight=cfg_trn["sampler"]["pos_weight"])
+    # --- Sampler (retro-compatível) ---
+    sampler_cfg = cfg_trn.get("sampler", {})
+    use_weighted = bool(sampler_cfg.get("use_weighted_windows", True))
+
+    sampler = None
+    if use_weighted:
+        # novo nome → fallback para antigo
+        pos_w = sampler_cfg.get("window_pos_weight", sampler_cfg.get("pos_weight", 4.0))
+        sampler = make_weighted_sampler(train_ds, pos_weight=float(pos_w))
 
     train_dl = DataLoader(
         train_ds,
-        batch_size=cfg_trn["training"]["batch_size"],
+        batch_size=int(trn.get("batch_size", 128)),
         sampler=sampler,
-        num_workers=0,                 # Windows-friendly
+        shuffle=(sampler is None),
+        num_workers=0,
         pin_memory=True,
         collate_fn=seq_collate,
     )
+
     val_dl = DataLoader(
         val_ds,
-        batch_size=cfg_trn["training"]["batch_size"],
+        batch_size=int(trn.get("batch_size", 128)),
         shuffle=False,
         num_workers=0,
         pin_memory=True,
         collate_fn=seq_collate,
     )
 
+    # --------- hiperparâmetros (retro-compat: training.* ou optimizer.* / reward.*) ---------
+    lr = float(trn.get("lr", opt_old.get("lr", 3.0e-4)))
+    betas = tuple(trn.get("betas", opt_old.get("betas", [0.9, 0.999])))
+    weight_decay = float(trn.get("weight_decay", opt_old.get("weight_decay", 0.01)))
+    label_smoothing = float(trn.get("label_smoothing", cfg_model.get("loss", {}).get("label_smoothing", 0.0)))
+
+    # class_weights pode vir de training.* (preferido) ou model.loss.* (legado)
+    class_weights = trn.get("class_weights", cfg_model.get("loss", {}).get("class_weights", [1.0, 1.0]))
+    class_weights = tuple(float(x) for x in class_weights)
+
+    wait_threshold = float(trn.get("wait_threshold", inf.get("wait_threshold", 0.55)))
+
+    reward_weights = trn.get("reward_weights", None)
+    if reward_weights is None:
+        # fallback para bloco reward legado
+        reward_weights = {
+            "cTP": float(reward_old.get("cTP", 1.0)),
+            "cTN": float(reward_old.get("cTN", 0.10)),
+            "cFP": float(reward_old.get("cFP", -0.10)),
+            "cFN": float(reward_old.get("cFN", -1.0)),
+            "cWAIT": float(reward_old.get("cWAIT", 0.0)),
+        }
+
     # --------- trainer ---------
     trainer = DTTrainer(
         ds_train=train_ds,
         ds_val=val_ds,
         cfg=TrainerConfig(
-            batch_size=cfg_trn["training"]["batch_size"],
-            max_epochs=cfg_trn["training"]["max_epochs"],
-            steps_per_epoch=cfg_trn["training"]["steps_per_epoch"],
-            grad_clip=cfg_trn["training"]["grad_clip"],
-            lr=cfg_trn["optimizer"]["lr"],
-            betas=tuple(cfg_trn["optimizer"]["betas"]),
-            weight_decay=cfg_trn["optimizer"]["weight_decay"],
-            wait_threshold=cfg_trn["inference"]["wait_threshold"],
-            class_weights=tuple(cfg_model["loss"]["class_weights"]),
-            label_smoothing=cfg_model["loss"]["label_smoothing"],
-            reward_weights={k: float(v) for k, v in cfg_trn["reward"].items()},
-            # opcional: ablação sem RTG na validação
-            # eval_no_rtg=cfg_trn.get("inference", {}).get("eval_no_rtg", False),
+            batch_size=int(trn.get("batch_size", 128)),
+            max_epochs=int(trn.get("max_epochs", 10)),
+            steps_per_epoch=trn.get("steps_per_epoch", None),
+            grad_clip=float(trn.get("grad_clip", 1.0)),
+            lr=lr,
+            betas=betas,
+            weight_decay=weight_decay,
+            wait_threshold=wait_threshold,
+            class_weights=class_weights,
+            label_smoothing=label_smoothing,
+            reward_weights={k: float(v) for k, v in reward_weights.items()},
         ),
         model_cfg=cfg_model,
         cat_cfg=cfg_model["categorical"],
@@ -123,12 +164,13 @@ def main():
         "action_tok": trainer.action_tok.state_dict(),
         "rtg_tok": trainer.rtg_tok.state_dict(),
         "time_tok": trainer.time_tok.state_dict(),
-        "norm_stats": train_ds._stats,                       # mean/std usados na normalização
-        "cat_maps": getattr(train_ds, "_cat_maps", None),    # stoi das colunas categóricas (treino)
+        "norm_stats": getattr(train_ds, "_stats", None),       # mean/std usados na normalização
+        "cat_maps": getattr(train_ds, "_cat_maps", None),      # stoi das colunas categóricas (treino)
         "cfg": {"model": cfg_model, "trainer": cfg_trn, "data": cfg_data},
     }
     torch.save(ckpt, ckpt_path)
     print(f"[CKPT] saved to: {ckpt_path.resolve()}")
+
 
 if __name__ == "__main__":
     # Info de device (útil para logs reprodutíveis)

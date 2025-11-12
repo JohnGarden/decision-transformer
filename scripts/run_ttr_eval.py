@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 from __future__ import annotations
+import argparse
 import os
 import re
 from pathlib import Path
@@ -8,16 +9,15 @@ from typing import Dict, List, Tuple, Iterable, Optional
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from sklearn.metrics import average_precision_score, f1_score
 
 from im12dt.data.dataset_seq import UNSWSequenceDataset, SeqDatasetConfig, seq_collate
 from im12dt.models.tokens import StateTokenizer, ActionTokenizer, RTGTokenizer, CatSpec, _rule_embed_dim
 from im12dt.models.temporal_embed import TimeEncodingFourier
 from im12dt.models.model_dt import DecisionTransformer
 
-from sklearn.metrics import average_precision_score, f1_score
 
-
-# --------------------------- utils ---------------------------
+# --------------------------- helpers ---------------------------
 
 def _interpolate_templates(obj, ctx):
     if isinstance(obj, dict):
@@ -56,6 +56,25 @@ def _quantize_time(x: float, scale: float = 1e6) -> int:
     return int(round(x * scale))
 
 
+def _ensure_dir(p: Path):
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _write_csv(path: Path, rows: List[List[str]], header: List[str]):
+    _ensure_dir(path)
+    with path.open("w", encoding="utf-8") as f:
+        f.write(",".join(header) + "\n")
+        for r in rows:
+            f.write(",".join(str(x) for x in r) + "\n")
+
+
+def _write_markdown_summary(path: Path, blocks: List[str]):
+    _ensure_dir(path)
+    with path.open("w", encoding="utf-8") as f:
+        for b in blocks:
+            f.write(b.rstrip() + "\n\n")
+
+
 # --------------------------- core eval ---------------------------
 
 @torch.no_grad()
@@ -66,7 +85,12 @@ def run_eval(
     ckpt_path: Optional[str | Path] = None,
     max_rows_val: Optional[int] = None,
     grid_wait: Iterable[float] = (0.30, 0.40, 0.50, 0.55, 0.60, 0.70, 0.80),
+    class_cuts: Iterable[float] = (0.5,),
+    detection_mode_print: str = "all",  # "all" | "last_step" | "any_step" | "tail_m_of_last_L"
+    tail_m: int = 1,
+    tail_L: int = 3,
     debug_missed: bool = False,
+    save_dir: Path = Path("artifacts"),
 ):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -94,10 +118,8 @@ def run_eval(
 
     ckpt = None
     try:
-        # Precisamos de objetos não-tensor (stats, maps) → weights_only=False
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    except Exception as e:
-        # fallback final (não recomendado, mas útil na prática)
+    except Exception:
         ckpt = torch.load(ckpt_path, map_location=device)
 
     norm_stats = ckpt.get('norm_stats', None)
@@ -187,10 +209,10 @@ def run_eval(
     all_p: List[np.ndarray] = []
     all_m: List[np.ndarray] = []
 
-    flows_attack_t: Dict[int, float] = {}           # fid -> min t(y==1)
+    flows_attack_t: Dict[int, float] = {}   # fid -> min t(y==1)
     flows_last_stats: Dict[int, List[Tuple[float,int,float]]] = {}  # fid -> [(t_last, a_last, c_last), ...]
-    flows_any_stats: Dict[int, List[Tuple[float,int,float]]]  = {}  # fid -> [(t, a, c), ...] (deduplicado por tempo)
-    flows_any_seen: Dict[int, set] = {}             # fid -> {quantized_time,...}
+    flows_any_stats: Dict[int, List[Tuple[float,int,float]]]  = {}  # fid -> [(t, a, c), ...] deduplicado por tempo
+    flows_any_seen: Dict[int, set] = {}     # fid -> {quantized_time,...}
 
     for batch in dl_val:
         # device
@@ -207,7 +229,9 @@ def run_eval(
         logits = model(s_emb, a_emb, r_emb, t_emb, batch['attn_mask'])
         logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
 
-        probs1 = torch.softmax(logits, dim=-1)[..., 1]
+        probs = torch.softmax(logits, dim=-1)          # (B,K,C)
+        probs1 = probs[..., 1]                         # P(class=1)
+        max_conf, argmax = probs.max(dim=-1)           # conf & predicted class
 
         # token-level
         all_y.append(batch['actions_out'].reshape(-1).detach().cpu().numpy())
@@ -221,21 +245,17 @@ def run_eval(
         y       = batch['actions_out']         # (B,K)
         fid     = batch['flow_id']             # (B,)
 
-        max_conf, argmax = torch.softmax(logits, dim=-1).max(dim=-1)  # (B,K)
-
         for i in range(B):
             f = int(fid[i].item())
             L = int(lengths[i].item())
-            # mapa de ataque (min tempo onde y==1)
             y_i = y[i, :L]
             t_i = abs_t[i, :L]
+
+            # mapa de ataque (min tempo onde y==1)
             pos_mask = (y_i == 1)
             if pos_mask.any():
                 t_pos_min = float(t_i[pos_mask].min().item())
-                if f not in flows_attack_t:
-                    flows_attack_t[f] = t_pos_min
-                else:
-                    flows_attack_t[f] = min(flows_attack_t[f], t_pos_min)
+                flows_attack_t[f] = min(flows_attack_t.get(f, t_pos_min), t_pos_min)
 
             # last-step
             j_last = L - 1
@@ -263,17 +283,18 @@ def run_eval(
     y_np = y_np[m_np]; p_np = np.clip(np.nan_to_num(p_np[m_np], nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
 
     pr_auc = 0.0 if (y_np.size==0 or y_np.max()==0) else float(average_precision_score(y_np, p_np))
-    f1 = float(f1_score(y_np, (p_np>=0.5).astype(int), zero_division=0))
-    print(f"Token-level  PR-AUC={pr_auc:.4f}  F1={f1:.4f}")
+    # F1 vai ser reportado por class_cut; mas imprimimos um default (primeiro da lista)
+    default_cut = next(iter(class_cuts)) if class_cuts else 0.5
+    f1_default = float(f1_score(y_np, (p_np>=default_cut).astype(int), zero_division=0))
+    print(f"Token-level  PR-AUC={pr_auc:.4f}  F1@{default_cut:.2f}={f1_default:.4f}")
 
-    # ---------- TTR helpers ----------
-    def summarize_ttr(stats: Dict[int, List[Tuple[float,int,float]]], thr: float) -> Tuple[int,int,float,float,float,float,float]:
-        """stats: fid -> [(t, a_pred, conf), ...] (ordenado internamente aqui)"""
+    # ---------- funções de TTR ----------
+    def summarize_last(stats_last: Dict[int, List[Tuple[float,int,float]]], thr: float):
         malicious_flows = len(flows_attack_t)
         detected = 0
         ttrs: List[float] = []
         for f, t_attack in flows_attack_t.items():
-            seq = sorted(stats.get(f, []))  # ordena por t
+            seq = sorted(stats_last.get(f, []))  # [(t_last, a_last, c_last), ...]
             t_detect = None
             for (t, a, c) in seq:
                 if (a == 1) and (c >= thr):
@@ -281,36 +302,166 @@ def run_eval(
                     break
             if t_detect is not None:
                 detected += 1
-                ttr = max(0.0, float(t_detect - t_attack))
-                ttrs.append(ttr)
+                ttrs.append(max(0.0, float(t_detect - t_attack)))
         rate = detected / max(malicious_flows, 1)
-        if len(ttrs) > 0:
-            p50 = float(np.percentile(ttrs, 50))
-            p90 = float(np.percentile(ttrs, 90))
-            avg = float(np.mean(ttrs))
-            worst = float(np.max(ttrs))
+        if ttrs:
+            p50 = float(np.percentile(ttrs, 50)); p90 = float(np.percentile(ttrs, 90))
+            avg = float(np.mean(ttrs)); worst = float(np.max(ttrs))
         else:
             p50 = p90 = avg = worst = float('nan')
         return malicious_flows, detected, rate, p50, p90, avg, worst
 
-    # ---------- prints ----------
-    grid_wait = list(grid_wait) if grid_wait else [0.30, 0.40, 0.50, 0.55, 0.60, 0.70, 0.80]
+    def summarize_any(stats_any: Dict[int, List[Tuple[float,int,float]]], thr: float):
+        malicious_flows = len(flows_attack_t)
+        detected = 0
+        ttrs: List[float] = []
+        for f, t_attack in flows_attack_t.items():
+            seq = sorted(stats_any.get(f, []))  # [(t, a, c), ...]
+            t_detect = None
+            for (t, a, c) in seq:
+                if (a == 1) and (c >= thr):
+                    t_detect = t
+                    break
+            if t_detect is not None:
+                detected += 1
+                ttrs.append(max(0.0, float(t_detect - t_attack)))
+        rate = detected / max(malicious_flows, 1)
+        if ttrs:
+            p50 = float(np.percentile(ttrs, 50)); p90 = float(np.percentile(ttrs, 90))
+            avg = float(np.mean(ttrs)); worst = float(np.max(ttrs))
+        else:
+            p50 = p90 = avg = worst = float('nan')
+        return malicious_flows, detected, rate, p50, p90, avg, worst
 
-    print("\nTTR summary (last-step):")
-    print("thr\tflows+\tdetected\trate\tTTR_P50\tTTR_P90\tTTR_avg\tTTR_max")
-    for thr in grid_wait:
-        mf, d, rate, p50, p90, avg, worst = summarize_ttr(flows_last_stats, thr)
-        print(f"{thr:.2f}\t{mf}\t{d}\t{rate:.3f}\t{p50:.3f}\t{p90:.3f}\t{avg:.3f}\t{worst:.3f}")
+    def summarize_tail(stats_any: Dict[int, List[Tuple[float,int,float]]], thr: float, m: int, L: int):
+        """Dispara se nos últimos L passos houver >= m passos 'attack' com conf>=thr."""
+        malicious_flows = len(flows_attack_t)
+        detected = 0
+        ttrs: List[float] = []
+        for f, t_attack in flows_attack_t.items():
+            seq = sorted(stats_any.get(f, []))  # [(t, a, c), ...]
+            hits = []  # lista de (t, hit_bool)
+            for (t, a, c) in seq:
+                hits.append((t, int((a == 1) and (c >= thr))))
+            # varre janela deslizante de tamanho L
+            t_detect = None
+            if hits:
+                # prefix sum de hits para fazer janela O(1)
+                pref = [0]
+                times = []
+                for (t, h) in hits:
+                    pref.append(pref[-1] + h)
+                    times.append(t)
+                for j in range(len(hits)):
+                    j0 = max(0, j - (L - 1))
+                    cnt = pref[j + 1] - pref[j0]
+                    if cnt >= m:
+                        t_detect = times[j]
+                        break
+            if t_detect is not None:
+                detected += 1
+                ttrs.append(max(0.0, float(t_detect - t_attack)))
+        rate = detected / max(malicious_flows, 1)
+        if ttrs:
+            p50 = float(np.percentile(ttrs, 50)); p90 = float(np.percentile(ttrs, 90))
+            avg = float(np.mean(ttrs)); worst = float(np.max(ttrs))
+        else:
+            p50 = p90 = avg = worst = float('nan')
+        return malicious_flows, detected, rate, p50, p90, avg, worst
 
-    print("\nTTR summary (any-step):")
-    print("thr\tflows+\tdetected\trate\tTTR_P50\tTTR_P90\tTTR_avg\tTTR_max")
-    for thr in grid_wait:
-        mf, d, rate, p50, p90, avg, worst = summarize_ttr(flows_any_stats, thr)
-        print(f"{thr:.2f}\t{mf}\t{d}\t{rate:.3f}\t{p50:.3f}\t{p90:.3f}\t{avg:.3f}\t{worst:.3f}")
+    # ---------- varreduras & salvamento ----------
+    save_dir = Path(save_dir)
+    csv_last = save_dir / "ttr_grid_last_step.csv"
+    csv_any  = save_dir / "ttr_grid_any_step.csv"
+    csv_tail = save_dir / "ttr_grid_tail_mL.csv"
 
-    # ---------- debug: fluxos não detectados ----------
+    header = ["mode", "wait_thr", "class_cut", "flows_pos", "detected", "rate",
+              "TTR_P50", "TTR_P90", "TTR_avg", "TTR_max", "PR_AUC", "F1"]
+
+    rows_last: List[List[str]] = []
+    rows_any:  List[List[str]] = []
+    rows_tail: List[List[str]] = []
+
+    for cls_cut in class_cuts:
+        f1_cur = float(f1_score(y_np, (p_np >= cls_cut).astype(int), zero_division=0))
+        for thr in grid_wait:
+            mf, d, rate, p50, p90, avg, worst = summarize_last(flows_last_stats, thr)
+            rows_last.append(["last_step", f"{thr:.2f}", f"{cls_cut:.2f}", mf, d, f"{rate:.4f}",
+                              f"{p50:.6f}", f"{p90:.6f}", f"{avg:.6f}", f"{worst:.6f}",
+                              f"{pr_auc:.6f}", f"{f1_cur:.6f}"])
+            mf, d, rate, p50, p90, avg, worst = summarize_any(flows_any_stats, thr)
+            rows_any.append(["any_step", f"{thr:.2f}", f"{cls_cut:.2f}", mf, d, f"{rate:.4f}",
+                             f"{p50:.6f}", f"{p90:.6f}", f"{avg:.6f}", f"{worst:.6f}",
+                             f"{pr_auc:.6f}", f"{f1_cur:.6f}"])
+            mf, d, rate, p50, p90, avg, worst = summarize_tail(flows_any_stats, thr, tail_m, tail_L)
+            rows_tail.append(["tail_m_of_last_L", f"{thr:.2f}", f"{cls_cut:.2f}", mf, d, f"{rate:.4f}",
+                              f"{p50:.6f}", f"{p90:.6f}", f"{avg:.6f}", f"{worst:.6f}",
+                              f"{pr_auc:.6f}", f"{f1_cur:.6f}"])
+
+    _write_csv(csv_last, rows_last, header)
+    _write_csv(csv_any,  rows_any,  header)
+    _write_csv(csv_tail, rows_tail, header)
+
+    # ---------- impressão resumida ----------
+    def _print_table(title: str, rows: List[List[str]]):
+        print(f"\n{title}")
+        print("thr\tflows+\tdetected\trate\tTTR_P50\tTTR_P90\tTTR_avg\tTTR_max")
+        # imprimir apenas a última linha por threshold com o class_cut default
+        def rows_for_cut(rows, cut):
+            return [r for r in rows if r[2] == f"{cut:.2f}"]
+        view = rows_for_cut(rows, default_cut)
+        for r in view:
+            _, thr, _, mf, d, rate, p50, p90, avg, worst, _, _ = r
+            print(f"{thr}\t{mf}\t{d}\t{rate}\t{p50}\t{p90}\t{avg}\t{worst}")
+
+    if detection_mode_print in ("all", "last_step"):
+        _print_table("TTR summary (last-step):", rows_last)
+    if detection_mode_print in ("all", "any_step"):
+        _print_table("TTR summary (any-step):", rows_any)
+    if detection_mode_print in ("all", "tail_m_of_last_L"):
+        _print_table(f"TTR summary (tail_m_of_last_L: m={tail_m}, L={tail_L}):", rows_tail)
+
+    # ---------- relatório markdown com "melhores" ----------
+    def _best_row(rows: List[List[str]]) -> List[str]:
+        """Escolhe melhor por maior 'rate' e, empate, menor TTR_P90."""
+        best = None
+        for r in rows:
+            rate = float(r[5]); p90 = float(r[7])
+            if best is None:
+                best = r
+            else:
+                br, bp90 = float(best[5]), float(best[7])
+                if (rate > br + 1e-12) or (abs(rate - br) <= 1e-12 and p90 < bp90):
+                    best = r
+        return best
+
+    best_last = _best_row(rows_last)
+    best_any  = _best_row(rows_any)
+    best_tail = _best_row(rows_tail)
+
+    md_blocks = []
+    md_blocks.append(f"# TTR Grid Summary\n\nCheckpoint: `{ckpt_path}`\n\nToken-level: PR-AUC={pr_auc:.4f}, F1@{default_cut:.2f}={f1_default:.4f}")
+    def _fmt_row(name: str, r: List[str]) -> str:
+        return (f"**{name}**  \n"
+                f"wait_thr={r[1]}, class_cut={r[2]}  \n"
+                f"flows+={r[3]}, detected={r[4]}, rate={r[5]}  \n"
+                f"TTR_P50={r[6]}s, TTR_P90={r[7]}s, TTR_avg={r[8]}s, TTR_max={r[9]}s  \n")
+    if best_last: md_blocks.append(_fmt_row("Best (last-step)", best_last))
+    if best_any:  md_blocks.append(_fmt_row("Best (any-step)", best_any))
+    if best_tail: md_blocks.append(_fmt_row(f"Best (tail m={tail_m}, L={tail_L})", best_tail))
+
+    _write_markdown_summary(save_dir / "ttr_summary.md", md_blocks)
+
+    # ---------- debug: fluxos não detectados (somente last-step @ default thr) ----------
     if debug_missed:
-        print("\n[DEBUG] Missed flows (amostra):")
+        thr = next(iter(grid_wait), 0.55)
+        print("\n[DEBUG] Missed flows (amostra) @ last-step:")
+        # map para listas por fluxo (last vs any)
+        last_by_f = {}
+        for r in rows_last:
+            if r[1] == f"{thr:.2f}" and r[2] == f"{default_cut:.2f}":
+                pass
+        # listar fluxos não detectados a esse thr
         missed = []
         for f, t_attack in flows_attack_t.items():
             seq_last = sorted(flows_last_stats.get(f, []))
@@ -318,9 +469,7 @@ def run_eval(
             # max confs
             max_last = max([c for (_, a, c) in seq_last], default=0.0)
             max_any  = max([c for (_, a, c) in seq_any],  default=0.0)
-            # detectado a 0.55?
-            det_last = any((a==1 and c>=0.55) for (_, a, c) in seq_last)
-            det_any  = any((a==1 and c>=0.55) for (_, a, c) in seq_any)
+            det_last = any((a==1 and c>=thr) for (_, a, c) in seq_last)
             if not det_last:
                 missed.append((f, max_last, max_any))
         missed.sort(key=lambda x: x[2], reverse=True)
@@ -331,23 +480,40 @@ def run_eval(
 # --------------------------- main ---------------------------
 
 if __name__ == "__main__":
-    # carregar configs
-    cfg_data = _interpolate_templates(
-        __import__("yaml").safe_load(Path('configs/data.yaml').read_text()),
-        __import__("yaml").safe_load(Path('configs/data.yaml').read_text())
-    )
-    cfg_model = __import__("yaml").safe_load(Path('configs/model_dt.yaml').read_text())
-    cfg_trn   = __import__("yaml").safe_load(Path('configs/trainer.yaml').read_text())
+    import yaml
 
-    # thresholds: pega da config se houver
-    grid = cfg_trn.get('inference', {}).get('grid_wait', [0.30, 0.40, 0.50, 0.55, 0.60, 0.70, 0.80])
+    cfg_data_raw = yaml.safe_load(Path('configs/data.yaml').read_text())
+    cfg_data = _interpolate_templates(cfg_data_raw, cfg_data_raw)
+    cfg_model = yaml.safe_load(Path('configs/model_dt.yaml').read_text())
+    cfg_trn   = yaml.safe_load(Path('configs/trainer.yaml').read_text())
+
+    # Args (opcionais para override)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--checkpoint", type=str, default=cfg_trn.get('inference', {}).get('checkpoint', None))
+    ap.add_argument("--detection_mode", type=str, default=cfg_trn.get('inference', {}).get('detection_mode', "all"),
+                    choices=["all", "last_step", "any_step", "tail_m_of_last_L"])
+    ap.add_argument("--tail_m", type=int, default=int(cfg_trn.get('inference', {}).get('tail_m', 1)))
+    ap.add_argument("--tail_L", type=int, default=int(cfg_trn.get('inference', {}).get('tail_L', 3)))
+    ap.add_argument("--grid_wait", type=str, default=",".join(str(x) for x in cfg_trn.get('inference', {}).get('grid_wait', [0.30,0.40,0.50,0.55,0.60,0.70,0.80])))
+    ap.add_argument("--class_cuts", type=str, default=",".join(str(x) for x in cfg_trn.get('inference', {}).get('class_cuts', [cfg_trn.get('inference', {}).get('class_cut', 0.5)])))
+    ap.add_argument("--max_rows", type=int, default=None)
+    ap.add_argument("--debug_missed", action="store_true")
+    args = ap.parse_args()
+
+    grid = [float(x) for x in args.grid_wait.split(",") if x.strip()!=""]
+    cuts = [float(x) for x in args.class_cuts.split(",") if x.strip()!=""]
 
     run_eval(
         model_cfg=cfg_model,
         trainer_cfg=cfg_trn,
         data_cfg=cfg_data,
-        ckpt_path=cfg_trn.get('inference', {}).get('checkpoint', None),
-        max_rows_val=None,
+        ckpt_path=args.checkpoint,
+        max_rows_val=args.max_rows,
         grid_wait=grid,
-        debug_missed=True,  # mude para True se quiser amostras dos perdidos
+        class_cuts=cuts if cuts else (0.5,),
+        detection_mode_print=args.detection_mode,
+        tail_m=args.tail_m,
+        tail_L=args.tail_L,
+        debug_missed=args.debug_missed,
+        save_dir=Path("artifacts"),
     )
